@@ -35,9 +35,19 @@ DEFAULT_VOLUME = int(os.getenv("DEFAULT_VOLUME", "50"))  # 0~100, 100 = 원본 �
 BITRATE = int(os.getenv("BITRATE", "128"))  # 전송 음질(kbps). 64로 낮추면 트래픽 절반
 DATA_FILE = os.getenv("DATA_FILE", "robin_data.json")  # 서버별 전용 채널/패널 저장
 STREAM_TTL = 60 * 60  # 스트림 URL 재사용 시간(초)
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))  # 차단 알림 DM 받을 사람. 0이면 봇 소유자
 
 COLOR = 0x5865F2
 COLOR_IDLE = 0x4E5058
+COLOR_WARN = 0xF0B232
+
+# 유튜브가 서버(IP)를 막았을 때 yt-dlp 오류에 나오는 문구들
+YT_BLOCK_HINTS = ("sign in to confirm", "not a bot", "http error 429", "too many requests")
+
+
+def is_yt_block(error: Exception) -> bool:
+    text = str(error).lower()
+    return any(h in text for h in YT_BLOCK_HINTS)
 LIST_PAGE_SIZE = 10  # [노래 목록] 한 페이지에 보이는 노래 수
 
 log = logging.getLogger("robin")
@@ -232,12 +242,19 @@ class GuildPlayer:
                 try:
                     stream = await asyncio.to_thread(resolve_stream, track)
                 except Exception as e:  # noqa: BLE001
+                    if is_yt_block(e):
+                        # 차단이면 다른 노래도 다 실패하므로 멈춤. 노래는 목록 맨 앞에 되돌려 둠
+                        self.queue.appendleft(track)
+                        await self.bot.report_block(self.guild, e)
+                        self.schedule_leave(IDLE_TIMEOUT)
+                        return
                     log.warning("resolve failed: %s (%s)", track.url, e)
                     await self.bot.notify(self.guild.id,
                                           f"⚠️ **{track.title}** 재생에 실패해서 건너뛸게요.\n`{str(e)[:180]}`")
                     continue
                 vc.play(make_source(stream, self.volume), after=self._after)
                 self.offset = 0.0
+                await self.bot.clear_block()
                 self.current = track
                 self.cancel_leave()
                 await self.update_panel()
@@ -541,6 +558,10 @@ class AddModal(discord.ui.Modal, title="노래 추가"):
         try:
             tracks = await asyncio.to_thread(search, q, itx.user.display_name)
         except Exception as e:  # noqa: BLE001
+            if is_yt_block(e):
+                await itx.client.report_block(itx.guild, e)
+                return await reply("⚠️ **유튜브가 로빈 서버의 접속을 막아서 노래를 가져올 수 없어요.**\n"
+                                   "관리자에게 알림을 보냈어요. 해결될 때까지 기다려주세요.", keep=True)
             return await reply(f"⚠️ 검색 실패: `{str(e)[:300]}`", keep=True)
         if not tracks:
             return await reply(f"`{q[:100]}` 검색 결과가 없어요.", keep=True)
@@ -575,6 +596,7 @@ class Robin(commands.Bot):
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self.players: dict[int, GuildPlayer] = {}
         self.panels: dict[int, dict] = self._load_panels()  # guild_id → {channel_id, message_id}
+        self.yt_block: Optional[str] = None  # 유튜브 차단 감지 시 오류 내용
         self._panels_restored = False
 
     # --- 저장 ---
@@ -604,8 +626,56 @@ class Robin(commands.Bot):
     def panel_kwargs(self, guild_id: int, notice: Optional[str] = None) -> dict:
         player = self.players.get(guild_id)
         if player and player.vc:
-            return {"embed": panel_embed(player), "view": ControlView(self, player)}
-        return {"embed": idle_embed(notice), "view": IdleView(self)}
+            kw = {"embed": panel_embed(player), "view": ControlView(self, player)}
+        else:
+            kw = {"embed": idle_embed(notice), "view": IdleView(self)}
+        if self.yt_block:
+            e = kw["embed"]
+            e.colour = COLOR_WARN
+            e.description = ("⚠️ **유튜브가 로빈 서버의 접속을 막았어요.**\n"
+                             "관리자가 해결할 때까지 노래를 재생할 수 없어요.\n\n" + (e.description or ""))
+        return kw
+
+    # --- 유튜브 차단 ---
+    async def report_block(self, guild: discord.Guild, error: Exception):
+        """차단 감지: 모든 패널에 경고 표시 + 관리자에게 DM (차단이 풀릴 때까지 1번만)"""
+        first = self.yt_block is None
+        self.yt_block = str(error)[:500]
+        log.error("유튜브 차단 감지 (%s): %s", guild.name, error)
+        if not first:
+            await self.refresh_panel(guild.id)
+            return
+        for gid in list(self.panels):
+            await self.refresh_panel(gid)
+        await self.dm_admin(
+            "⚠️ **[Robin] 유튜브가 로빈 서버의 접속을 막았어요.**\n"
+            f"- 처음 감지된 곳: **{guild.name}**\n"
+            f"- 시각: <t:{int(time.time())}:F>\n"
+            f"- 오류: `{str(error)[:300]}`\n\n"
+            "**해결 방법**: 서버의 `~/robin` 폴더에 유튜브 쿠키 파일(`cookies.txt`)을 넣고 "
+            "`sudo systemctl restart robin` 으로 재시작하세요.\n"
+            "-# 노래가 다시 재생되면 자동으로 경고가 사라지고 알려드려요."
+        )
+
+    async def clear_block(self):
+        if self.yt_block is None:
+            return
+        self.yt_block = None
+        log.info("유튜브 차단 해제 확인")
+        for gid in list(self.panels):
+            await self.refresh_panel(gid)
+        await self.dm_admin("✅ **[Robin] 유튜브 재생이 다시 정상으로 돌아왔어요.**")
+
+    async def dm_admin(self, text: str):
+        try:
+            uid = ADMIN_USER_ID
+            if not uid:
+                app = await self.application_info()
+                uid = app.owner.id
+            user = self.get_user(uid) or await self.fetch_user(uid)
+            await user.send(text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("관리자 DM 실패: %s", e)
 
     def panel_channel(self, guild_id: int) -> Optional[discord.TextChannel]:
         cfg = self.panels.get(guild_id)

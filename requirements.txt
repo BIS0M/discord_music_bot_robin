@@ -1,0 +1,5 @@
+discord.py[voice]>=2.7.1
+# davey 0.2.x는 discord.py 2.7.1과 호환 안 됨 (암호화 ready가 안 돼서 소리 안 남)
+davey==0.1.7
+yt-dlp[default]
+python-dotenv

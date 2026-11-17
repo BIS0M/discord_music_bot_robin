@@ -453,11 +453,11 @@ class IdleView(discord.ui.View):
     def __init__(self, bot: "Robin"):
         super().__init__(timeout=None)
         self.bot = bot
+        _button(self, "부르기", "robin:summon", discord.ButtonStyle.primary, 0, self.on_summon)
 
     async def interaction_check(self, itx: discord.Interaction) -> bool:
         self.bot.adopt_panel(itx)
         return True
-        _button(self, "부르기", "robin:summon", discord.ButtonStyle.primary, 0, self.on_summon)
 
     async def on_summon(self, itx: discord.Interaction):
         if not itx.user.voice or not itx.user.voice.channel:

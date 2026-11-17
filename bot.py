@@ -11,6 +11,8 @@ import itertools
 import json
 import logging
 import os
+import queue
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -65,14 +67,80 @@ if os.path.isfile(COOKIES):
 FFMPEG_BEFORE = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin"
 
 
-def make_source(stream_url: str, volume: float, start: float = 0.0) -> discord.AudioSource:
-    """ffmpeg이 볼륨 조절과 Opus 압축까지 끝낸 소리를 받음.
-    Python은 다 만든 조각을 20ms마다 보내기만 해서 박자가 덜 흔들린다."""
+BUFFER_FRAMES = 500   # 미리 받아두는 최대 분량 (20ms × 500 = 10초)
+PREFILL_FRAMES = 50   # 재생 시작 전에 채울 분량 (1초)
+OPUS_SILENCE = b"\xf8\xff\xfe"  # 20ms 무음 Opus 조각
+
+
+class BufferedOpusAudio(discord.AudioSource):
+    """ffmpeg 출력을 별도 스레드에서 미리 받아두는 버퍼.
+
+    discord.py는 read()가 늦어지면 밀린 조각을 몰아서 보내 따라잡는데,
+    이게 '노래가 빨라졌다 느려졌다' 하는 원인이다 (discord.py #9120).
+    버퍼에서 바로 꺼내 주고, 버퍼가 비면 따라잡기 대신 짧은 무음을 넣는다.
+    """
+
+    def __init__(self, inner: discord.FFmpegOpusAudio):
+        self.inner = inner
+        self.q: queue.Queue[bytes] = queue.Queue(maxsize=BUFFER_FRAMES)
+        self.eof = threading.Event()
+        self.closed = threading.Event()
+        self.underruns = 0
+        threading.Thread(target=self._fill, daemon=True, name="robin-buffer").start()
+
+    def _fill(self):
+        try:
+            while not self.closed.is_set():
+                pkt = self.inner.read()
+                if not pkt:
+                    break
+                while not self.closed.is_set():
+                    try:
+                        self.q.put(pkt, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+        except Exception as e:  # noqa: BLE001
+            log.warning("buffer read failed: %s", e)
+        finally:
+            self.eof.set()
+
+    def wait_prefill(self, frames: int = PREFILL_FRAMES, timeout: float = 8.0):
+        """재생 전에 버퍼를 조금 채움 (블로킹, 스레드에서 호출)"""
+        end = time.monotonic() + timeout
+        while self.q.qsize() < frames and not self.eof.is_set() and time.monotonic() < end:
+            time.sleep(0.02)
+
+    def is_opus(self) -> bool:
+        return True
+
+    def read(self) -> bytes:
+        try:
+            return self.q.get_nowait()
+        except queue.Empty:
+            pass
+        if self.eof.is_set():
+            try:
+                return self.q.get_nowait()  # eof 직전에 들어온 조각
+            except queue.Empty:
+                return b""  # 곡 끝
+        self.underruns += 1
+        if self.underruns % 50 == 1:
+            log.info("버퍼가 비어서 무음으로 채움 (누적 %d회)", self.underruns)
+        return OPUS_SILENCE
+
+    def cleanup(self):
+        self.closed.set()
+        self.inner.cleanup()
+
+
+def make_source(stream_url: str, volume: float, start: float = 0.0) -> BufferedOpusAudio:
+    """ffmpeg이 볼륨 조절과 Opus 압축까지 끝낸 소리를 버퍼에 미리 받아둠"""
     before = FFMPEG_BEFORE + (f" -ss {start:.2f}" if start > 0 else "")
-    return discord.FFmpegOpusAudio(
+    return BufferedOpusAudio(discord.FFmpegOpusAudio(
         stream_url, bitrate=BITRATE, executable=FFMPEG,
-        before_options=before, options=f"-vn -af volume={volume:.2f}",
-    )
+        before_options=before, options=f"-vn -af volume={volume:.2f} -application audio",
+    ))
 
 
 # ---------------------------------------------------------------- yt-dlp ----
@@ -200,7 +268,9 @@ class GuildPlayer:
         was_paused = vc.is_paused()
         pos = self.position()
         old = vc.source
-        vc.source = make_source(t.stream_url, volume, pos)  # 내부에서 잠깐 멈췄다 다시 재생함
+        new = make_source(t.stream_url, volume, pos)
+        new.wait_prefill(10, timeout=2.0)  # 0.2초만 채우고 바로 교체 (끊김 최소화)
+        vc.source = new  # 내부에서 잠깐 멈췄다 다시 재생함
         if was_paused:
             vc.pause()
         p = getattr(vc, "_player", None)
@@ -252,7 +322,12 @@ class GuildPlayer:
                     await self.bot.notify(self.guild.id,
                                           f"⚠️ **{track.title}** 재생에 실패해서 건너뛸게요.\n`{str(e)[:180]}`")
                     continue
-                vc.play(make_source(stream, self.volume), after=self._after)
+                source = make_source(stream, self.volume)
+                await asyncio.to_thread(source.wait_prefill)
+                if not vc.is_connected() or vc.is_playing() or vc.is_paused():
+                    source.cleanup()
+                    return
+                vc.play(source, after=self._after)
                 self.offset = 0.0
                 await self.bot.clear_block()
                 self.current = track
@@ -378,6 +453,10 @@ class IdleView(discord.ui.View):
     def __init__(self, bot: "Robin"):
         super().__init__(timeout=None)
         self.bot = bot
+
+    async def interaction_check(self, itx: discord.Interaction) -> bool:
+        self.bot.adopt_panel(itx)
+        return True
         _button(self, "부르기", "robin:summon", discord.ButtonStyle.primary, 0, self.on_summon)
 
     async def on_summon(self, itx: discord.Interaction):
@@ -403,6 +482,10 @@ class IdleView(discord.ui.View):
 
 class ControlView(discord.ui.View):
     """로빈이 음성 채널에 있을 때의 패널"""
+
+    async def interaction_check(self, itx: discord.Interaction) -> bool:
+        self.bot.adopt_panel(itx)
+        return True
 
     def __init__(self, bot: "Robin", player: Optional[GuildPlayer] = None):
         super().__init__(timeout=None)
@@ -676,6 +759,18 @@ class Robin(commands.Bot):
             await user.send(text)
         except Exception as e:  # noqa: BLE001
             log.warning("관리자 DM 실패: %s", e)
+
+    def adopt_panel(self, itx: discord.Interaction):
+        """등록된 패널이 없는 서버에서 패널 버튼이 눌리면 그 메시지를 패널로 등록
+        (예: 다른 컴퓨터에서 /setup 한 패널을 서버로 옮겨 온 경우)"""
+        msg = itx.message
+        if not msg or not itx.guild_id or itx.guild_id in self.panels:
+            return
+        if msg.author.id != self.user.id:
+            return
+        self.panels[itx.guild_id] = {"channel_id": msg.channel.id, "message_id": msg.id}
+        self._save_panels()
+        log.info("서버 %s의 패널을 자동 등록했어요", itx.guild_id)
 
     def panel_channel(self, guild_id: int) -> Optional[discord.TextChannel]:
         cfg = self.panels.get(guild_id)
